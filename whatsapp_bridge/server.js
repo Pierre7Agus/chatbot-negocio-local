@@ -3,15 +3,14 @@ const {
     useMultiFileAuthState, 
     DisconnectReason, 
     fetchLatestBaileysVersion,
-    Browsers,
-    downloadMediaMessage
+    Browsers 
 } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json());
 
 const PORT = 3001;
 const PYTHON_WEBHOOK = "http://localhost:8000/webhook";
@@ -76,66 +75,35 @@ async function startWhatsApp() {
                 return;
             }
 
-            // Detección de contenido multimedia y texto
-            const isImage = Boolean(msg.message?.imageMessage);
-            const isAudio = Boolean(msg.message?.audioMessage);
-            
-            let messageType = "text";
-            let mediaBase64 = null;
-            let mimeType = null;
-            let textContent = 
+            // Extraer el contenido del texto
+            const text = 
                 msg.message?.conversation || 
                 msg.message?.extendedTextMessage?.text || 
-                msg.message?.imageMessage?.caption || 
                 "";
-
+            
             const senderName = msg.pushName || "Cliente";
 
-            if (isImage) {
-                messageType = "image";
-                console.log(`📸 Imagen detectada de ${senderName}`);
-                try {
-                    const buffer = await downloadMediaMessage(msg, "buffer", {});
-                    mediaBase64 = buffer.toString("base64");
-                    mimeType = msg.message.imageMessage.mimetype || "image/jpeg";
-                } catch (mediaErr) {
-                    console.error("❌ Error descargando imagen de Baileys:", mediaErr.message);
-                }
-            } else if (isAudio) {
-                messageType = "audio";
-                console.log(`🎙️ Nota de voz / Audio detectado de ${senderName}`);
-                try {
-                    const buffer = await downloadMediaMessage(msg, "buffer", {});
-                    mediaBase64 = buffer.toString("base64");
-                    mimeType = msg.message.audioMessage.mimetype || "audio/ogg; codecs=opus";
-                } catch (mediaErr) {
-                    console.error("❌ Error descargando audio de Baileys:", mediaErr.message);
-                }
-            }
+            console.log(`👤 Remitente: ${senderName} | Texto: "${text}"`);
 
-            console.log(`👤 Remitente: ${senderName} | Tipo: ${messageType} | Texto/Caption: "${textContent}"`);
-
-            if (textContent.trim() || mediaBase64) {
+            if (text.trim()) {
                 // 1. Activar animación de "escribiendo..." en WhatsApp
                 await sock.sendPresenceUpdate('composing', remoteJid);
-                console.log("🚀 Enviando payload a FastAPI (http://localhost:8000/webhook)...");
+                console.log("🚀 Enviando mensaje a FastAPI (http://localhost:8000/webhook)...");
 
                 try {
                     const response = await axios.post(PYTHON_WEBHOOK, {
                         remoteJid: remoteJid,
                         name: senderName,
-                        messageType: messageType,
-                        message: textContent,
-                        mediaBase64: mediaBase64,
-                        mimeType: mimeType
+                        message: text
                     });
                     console.log(`📡 Respuesta de FastAPI: Código ${response.status}`);
                 } catch (apiErr) {
+                    // Si FastAPI falla o está apagado, quitamos los tres puntos
                     await sock.sendPresenceUpdate('paused', remoteJid);
                     throw apiErr;
                 }
             } else {
-                console.log("⚠️ Mensaje recibido sin contenido procesable.");
+                console.log("⚠️ Mensaje recibido sin texto detectable (sticker, audio, etc.).");
             }
         } catch (err) {
             console.error("❌ Error procesando mensaje entrante en Node:", err.message);

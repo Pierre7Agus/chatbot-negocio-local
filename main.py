@@ -6,8 +6,7 @@ import json
 import asyncio
 import base64
 from datetime import datetime
-from typing import Annotated, Literal, Optional
-from pydantic import BaseModel, Field
+from typing import Annotated, Literal
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenAIEmbeddings
 
@@ -605,118 +604,33 @@ def limpiar_numero(numero: str) -> str:
     return numero.replace("@s.whatsapp.net", "").replace("+", "").replace(" ", "")
 
 
-async def enviar_mensaje_whatsapp(to: str, mensaje: str):
-    """Envía un mensaje de texto al usuario utilizando la Cloud API oficial de Meta."""
-    
-    phone = limpiar_numero(to)
-    
-    if not PHONE_NUMBER_ID or not WHATSAPP_TOKEN:
-        print("⚠️ PHONE_NUMBER_ID o WHATSAPP_TOKEN no configurado en entorno.")
-        return
-
-    url = f"{GRAPH_API_URL}/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"body": mensaje}
-    }
-    
+async def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
+    url = "http://localhost:3001/send"
+    payload = {"remoteJid": remote_jid, "text": mensaje}
     try:
-        response = await http_client.post(url, headers=headers, json=payload, timeout=10.0)
+        response = await http_client.post(url, json=payload)
         response.raise_for_status()
-        print(f"📤 Mensaje oficial enviado vía Meta Graph API a {phone}.")
     except httpx.HTTPStatusError as e:
-        print(f"❌ Error HTTP al enviar WhatsApp vía Meta ({e.response.status_code}): {e.response.text}")
+        print(f"❌ Error HTTP al enviar WhatsApp ({e.response.status_code}): {e.response.text}")
     except Exception as e:
-        print(f"❌ Error de conexión con Meta Graph API: {e}")
+        print(f"❌ Error de conexión con WhatsApp Gateway: {e}")
 
 
-async def procesar_mensaje_ia(
-    remote_jid: str, 
-    nombre_remitente: str, 
-    texto: str,
-    message_type: str = "text",
-    media_id_or_b64: Optional[str] = None,
-    mime_type: Optional[str] = None
-):
+async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str):
     telefono = remote_jid.replace("@s.whatsapp.net", "").replace("@lid", "")
     config = {"configurable": {"thread_id": telefono}}
     
-    # 1. Validación de longitud de texto
-    if message_type == "text" and len(texto) > LIMITES_META["texto"]:
-        await enviar_mensaje_whatsapp(
-            remote_jid,
-            "⚠️ Tu mensaje es demasiado largo. Por favor envíame tu consulta resumida en un par de líneas."
-        )
-        return
-
-    base64_final = None
-    mime_final = mime_type
-
-    # 2. Si viene un media_id de Meta (o Base64), procesarlo/descargarlo
-    if message_type in ["image", "audio", "video", "document"] and media_id_or_b64:
-        if len(media_id_or_b64) < 300 and "/" not in media_id_or_b64[:20]:
-            # Es un MEDIA_ID de Meta Cloud API
-            b64_data, mime_detected, estado = await descargar_media_meta_con_limite(media_id_or_b64)
-            if estado == "imagen_muy_grande":
-                await enviar_mensaje_whatsapp(
-                    remote_jid, 
-                    "⚠️ La imagen enviada pesa más de 5 MB. Por favor envíala comprimida."
-                )
-                return
-            elif estado == "audio_muy_largo":
-                await enviar_mensaje_whatsapp(
-                    remote_jid, 
-                    "⚠️ El audio enviado es muy largo (máx 3 MB / ~90 seg). Por favor envía una nota de voz más corta."
-                )
-                return
-            elif estado == "ok":
-                base64_final = b64_data
-                mime_final = mime_detected
-        else:
-            base64_final = media_id_or_b64
-
-    # 3. Recuperar memoria RAG del cliente
-    consulta_memoria = texto or ("imagen adjunta" if message_type == "image" else "audio de voz")
-    antecedentes = await recuperar_memoria_cliente(telefono, consulta_memoria)
+    antecedentes = await recuperar_memoria_cliente(telefono, texto)
     
-    prompt_contexto = (
+    prompt_usuario = (
         f"[Antecedentes del cliente en sistema: {antecedentes}]\n"
-        f"[Cliente: {nombre_remitente}, Tel: {telefono}]"
+        f"[Cliente: {nombre_remitente}, Tel: {telefono}]: {texto}"
     )
-    
-    content_blocks = []
-    
-    if message_type == "image" and base64_final:
-        clean_mime = mime_final.split(";")[0] if mime_final else "image/jpeg"
-        prompt_texto = f"{prompt_contexto}\n[El cliente envió una imagen/foto con el comentario: '{texto}']\nAnaliza la imagen enviada para comprender su solicitud de diseño gráfico."
-        content_blocks.append({"type": "text", "text": prompt_texto})
-        content_blocks.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{clean_mime};base64,{base64_final}"}
-        })
-    elif message_type == "audio" and base64_final:
-        clean_mime = mime_final.split(";")[0] if mime_final else "audio/ogg"
-        prompt_texto = f"{prompt_contexto}\n[El cliente envió una nota de voz/audio]. Escucha el audio atentamente y responde su solicitud comercial."
-        content_blocks.append({"type": "text", "text": prompt_texto})
-        content_blocks.append({
-            "type": "media",
-            "mime_type": clean_mime,
-            "data": base64_final
-        })
-    else:
-        prompt_texto = f"{prompt_contexto}: {texto}"
-        content_blocks.append({"type": "text", "text": prompt_texto})
     
     # Restringe a 5 llamadas simultáneas hacia la API de Google
     async with gemini_semaphore:
         output = await graph.ainvoke(
-            {"messages": [HumanMessage(content=content_blocks)]},
+            {"messages": [HumanMessage(content=prompt_usuario)]},
             config=config
         )
     
@@ -729,11 +643,10 @@ async def procesar_mensaje_ia(
     await enviar_mensaje_whatsapp(remote_jid, respuesta_final)
     
     # Tarea en background para guardar memoria del cliente sin bloquear
-    texto_resumen = texto or (f"[{message_type.upper()} enviado por cliente]" if message_type != "text" else "")
     asyncio.create_task(
         asyncio.to_thread(
             extraer_y_guardar_hechos_cliente,
-            telefono, nombre_remitente, texto_resumen, respuesta_final
+            telefono, nombre_remitente, texto, respuesta_final
         )
     )
 
@@ -798,46 +711,32 @@ async def verificar_webhook(request: Request):
 # --- TU ENDPOINT ADAPTADO (POST) ---
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
-    body = await request.json()
-    print("🔥 WEBHOOK CRUDO:", body) # <--- ESTO ES CLAVE
-    try:
-        entry = body.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {})
-        if "messages" not in entry:
-            return {"status": "received"}
+    datos = await request.json()
+    remote_jid = datos.get("remoteJid", "")
+    nombre = datos.get("name", "Cliente")
+    texto = (datos.get("message") or "").strip()
 
-        msg = entry["messages"][0]
-        contact = entry.get("contacts", [{}])[0]
+    if remote_jid and texto:
+        # Extraer identificador numérico
+        identificador = remote_jid.split("@")[0]
 
-        sender_phone = limpiar_numero(msg.get("from", ""))
-        remote_jid = sender_phone # YA NO usamos @s.whatsapp.net para Cloud API
-        nombre = contact.get("profile", {}).get("name", "Cliente")
-        msg_type = msg.get("type", "text")
-
-        texto = ""
-        media_id = mime = None
-
-        if msg_type == "text":
-            texto = msg.get("text", {}).get("body", "")
-        elif msg_type in ["image", "audio", "video", "document"]:
-            media_id = msg.get(msg_type, {}).get("id")
-            mime = msg.get(msg_type, {}).get("mime_type")
-            texto = msg.get(msg_type, {}).get("caption", "")
-
-        es_admin = bool(ADMIN_PHONE and limpiar_numero(ADMIN_PHONE) in sender_phone)
+        # --- COMANDOS EXCLUSIVOS DE ADMINISTRADOR ---
+        # Verifica si el remitente coincide con el admin y si solicita el reporte
+        es_admin = bool(ADMIN_PHONE and (ADMIN_PHONE in identificador or identificador in ADMIN_PHONE))
 
         if es_admin and texto.lower() in ["/reporte", "/ventas", "!reporte"]:
-            print(f"👑 Comando admin desde {sender_phone}: {texto}")
+            print(f"👑 Comando admin desde ejecutado: {texto}")
             reporte_texto = await obtener_resumen_ventas_hoy()
             await enviar_mensaje_whatsapp(remote_jid, reporte_texto)
             return {"status": "received"}
 
-        if remote_jid and (texto or media_id):
-            background_tasks.add_task(
-                procesar_mensaje_ia, remote_jid, nombre, texto, msg_type, media_id, mime
-            )
-
-    except Exception as e:
-        print(f"❌ Error procesando webhook: {e}")
+        # Flujo normal para clientes hacia Gemini / LangGraph
+        background_tasks.add_task(
+            procesar_mensaje_ia, 
+            remote_jid, 
+            nombre, 
+            texto
+        )
 
     return {"status": "received"}
 
