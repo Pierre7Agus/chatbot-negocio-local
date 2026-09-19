@@ -755,19 +755,41 @@ async def verificar_webhook(request: Request):
 
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
-    body = await request.json()
-    print("🔥 WEBHOOK CRUDO:", body)
     try:
-        entry = body.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {})
-        if "messages" not in entry:
-            return {"status": "received"}
+        body = await request.json()
+        print("🔥 WEBHOOK CRUDO RECIBIDO:", body)  # Esto debe verse SIEMPRE en los logs de Vercel
+    except Exception as err:
+        print(f"❌ Error al parsear JSON de la petición: {err}")
+        return {"status": "error", "message": "Invalid JSON"}, 400
 
-        # Extraer Tenant ID (número telefónico receptor del negocio)
-        metadata_value = entry.get("metadata", {})
+    try:
+        entry_list = body.get("entry", [])
+        if not entry_list:
+            return {"status": "ignored_no_entry"}
+
+        changes = entry_list[0].get("changes", [])
+        if not changes:
+            return {"status": "ignored_no_changes"}
+
+        value = changes[0].get("value", {})
+
+        # Si es una notificación de estado (entregado, leído, etc.), la ignoramos limpiamente
+        if "statuses" in value and "messages" not in value:
+            print("ℹ️ Notificación de estado recibida (sent/delivered/read), ignorando...")
+            return {"status": "received_status"}
+
+        # Verificar que realmente exista un mensaje
+        if "messages" not in value or not value["messages"]:
+            print("⚠️ El payload recibido no contiene la clave 'messages'")
+            return {"status": "ignored_no_messages"}
+
+        # Extraer Metadata
+        metadata_value = value.get("metadata", {})
         tenant_phone = limpiar_numero(metadata_value.get("display_phone_number") or metadata_value.get("phone_number_id") or "default_tenant")
 
-        msg = entry["messages"][0]
-        contact = entry.get("contacts", [{}])[0]
+        msg = value["messages"][0]
+        contacts = value.get("contacts", [{}])
+        contact = contacts[0] if contacts else {}
 
         sender_phone = limpiar_numero(msg.get("from", ""))
         remote_jid = sender_phone
@@ -793,12 +815,13 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
             return {"status": "received"}
 
         if remote_jid and (texto or media_id):
+            print(f"🚀 Enviando a BackgroundTask para {remote_jid}: {texto}")
             background_tasks.add_task(
                 procesar_mensaje_ia, tenant_phone, remote_jid, nombre, texto, msg_type, media_id, mime
             )
 
     except Exception as e:
-        print(f"❌ Error procesando webhook: {e}")
+        print(f"❌ Error procesando estructura del webhook: {e}")
 
     return {"status": "received"}
 
