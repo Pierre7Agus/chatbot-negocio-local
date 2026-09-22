@@ -14,7 +14,7 @@ from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, BackgroundTasks, Response
+from fastapi import FastAPI, Request, BackgroundTasks, Response, Form
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -33,6 +33,9 @@ import psycopg
 
 from typing_extensions import TypedDict
 from contextlib import asynccontextmanager
+
+from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
@@ -108,6 +111,17 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 app = FastAPI(title="WhatsApp AI Sales Agent (Supabase Multi-Tenant)", lifespan=lifespan)
+
+
+TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+
+# Variables de entorno de Twilio
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")  # Ej: 'whatsapp:+17372508034'
+
+# Inicialización del cliente
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 
 app.add_middleware(
     CORSMiddleware,
@@ -588,29 +602,56 @@ async def descargar_media_meta_con_limite(media_id: str):
 
 
 async def enviar_mensaje_whatsapp(to: str, mensaje: str):
-    phone = limpiar_numero(to)
-    if not PHONE_NUMBER_ID or not WHATSAPP_TOKEN:
-        print("⚠️ PHONE_NUMBER_ID o WHATSAPP_TOKEN no configurado en entorno.")
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_NUMBER:
+        print("⚠️ Credenciales de Twilio (SID, Token o Número) no configuradas en el entorno.")
         return
 
-    url = f"{GRAPH_API_URL}/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"body": mensaje}
-    }
+    # Formatear el destinatario asegurando el prefijo 'whatsapp:'
+    destinatario = to if to.startswith("whatsapp:") else f"whatsapp:{limpiar_numero(to)}"
+
+    try:
+        # Petición a la API de Twilio (se usa asyncio.to_thread porque la librería oficial es síncrona)
+        message = await asyncio.to_thread(
+            client.messages.create,
+            body=mensaje,
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=destinatario
+        )
+        print(f"📤 Mensaje enviado vía Twilio a {destinatario}. SID: {message.sid}")
+    except Exception as e:
+        print(f"❌ Error enviando WhatsApp vía Twilio: {e}")
+
+import base64
+import httpx
+
+async def descargar_media_twilio_con_limite(media_url: str):
+    """
+    Descarga archivos multimedia alojados en los servidores de Twilio
+    usando Basic Auth (TWILIO_ACCOUNT_SID y TWILIO_AUTH_TOKEN).
+    """
+    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     
     try:
-        response = await http_client.post(url, headers=headers, json=payload, timeout=10.0)
-        response.raise_for_status()
-        print(f"📤 Mensaje oficial enviado vía Meta Graph API a {phone}.")
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            # Petición HEAD o GET para comprobar tamaño
+            response = await client.get(media_url, auth=auth, timeout=15.0)
+            response.raise_for_status()
+            
+            content_length = len(response.content)
+            mime_type = response.headers.get("content-type", "")
+            
+            # Validaciones de tamaño
+            if "image" in mime_type and content_length > 5 * 1024 * 1024:
+                return None, mime_type, "imagen_muy_grande"
+            if "audio" in mime_type and content_length > 3 * 1024 * 1024:
+                return None, mime_type, "audio_muy_largo"
+                
+            b64_data = base64.b64encode(response.content).decode("utf-8")
+            return b64_data, mime_type, "ok"
+            
     except Exception as e:
-        print(f"❌ Error enviando WhatsApp vía Meta: {e}")
+        print(f"❌ Error descargando media de Twilio: {e}")
+        return None, None, "error"
 
 
 async def procesar_mensaje_ia(
@@ -619,14 +660,16 @@ async def procesar_mensaje_ia(
     nombre_remitente: str, 
     texto: str,
     message_type: str = "text",
-    media_id_or_b64: Optional[str] = None,
+    media_url_or_b64: Optional[str] = None, # Ahora Twilio pasa una URL (MediaUrl0) o base64
     mime_type: Optional[str] = None
 ):
     telefono = limpiar_numero(remote_jid)
     thread_id = f"{tenant_phone}_{telefono}"
     config = {"configurable": {"thread_id": thread_id, "tenant_phone": tenant_phone}}
     
-    if message_type == "text" and len(texto) > LIMITES_META["texto"]:
+    # Límite de texto genérico (por ejemplo, 4000 caracteres)
+    LIMITES_TEXTO = 4000
+    if message_type == "text" and len(texto) > LIMITES_TEXTO:
         await enviar_mensaje_whatsapp(
             remote_jid,
             "⚠️ Tu mensaje es demasiado largo. Por favor envíame tu consulta resumida en un par de líneas."
@@ -636,9 +679,10 @@ async def procesar_mensaje_ia(
     base64_final = None
     mime_final = mime_type
 
-    if message_type in ["image", "audio", "video", "document"] and media_id_or_b64:
-        if len(media_id_or_b64) < 300 and "/" not in media_id_or_b64[:20]:
-            b64_data, mime_detected, estado = await descargar_media_meta_con_limite(media_id_or_b64)
+    if message_type in ["image", "audio", "video", "document"] and media_url_or_b64:
+        # Si recibimos una URL de Twilio (empieza con http/https), la descargamos usando Auth de Twilio
+        if media_url_or_b64.startswith("http"):
+            b64_data, mime_detected, estado = await descargar_media_twilio_con_limite(media_url_or_b64)
             if estado == "imagen_muy_grande":
                 await enviar_mensaje_whatsapp(remote_jid, "⚠️ La imagen pesa más de 5 MB.")
                 return
@@ -647,9 +691,9 @@ async def procesar_mensaje_ia(
                 return
             elif estado == "ok":
                 base64_final = b64_data
-                mime_final = mime_detected
+                mime_final = mime_detected or mime_type
         else:
-            base64_final = media_id_or_b64
+            base64_final = media_url_or_b64
 
     # Recuperar memoria RAG multi-tenant del cliente
     consulta_memoria = texto or ("imagen adjunta" if message_type == "image" else "audio de voz")
@@ -705,7 +749,6 @@ async def procesar_mensaje_ia(
         )
     )
 
-
 async def obtener_resumen_ventas_hoy(tenant_phone: str) -> str:
     """Consulta las ventas del día en Supabase para un tenant específico."""
     hoy_str = datetime.now().strftime("%Y-%m-%d")
@@ -753,77 +796,70 @@ async def verificar_webhook(request: Request):
     return Response(content="Error de verificación", status_code=403)
 
 
-@app.post("/webhook")
-async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
+@app.post("/webhook/twilio")
+async def recibir_webhook_twilio(
+    background_tasks: BackgroundTasks,
+    From: str = Form(""),          # Número del cliente (ej: 'whatsapp:+593991034932')
+    Body: str = Form(""),          # Texto del mensaje
+    ProfileName: str = Form("Cliente"), # Nombre en WhatsApp
+    NumMedia: int = Form(0),       # Cantidad de archivos multimedia
+    MediaUrl0: str = Form(None),   # URL de la imagen/audio si existe
+    MediaContentType0: str = Form(None) # MIME type
+):
     try:
-        body = await request.json()
-        print("🔥 WEBHOOK CRUDO RECIBIDO:", body)  # Esto debe verse SIEMPRE en los logs de Vercel
-    except Exception as err:
-        print(f"❌ Error al parsear JSON de la petición: {err}")
-        return {"status": "error", "message": "Invalid JSON"}, 400
-
-    try:
-        entry_list = body.get("entry", [])
-        if not entry_list:
-            return {"status": "ignored_no_entry"}
-
-        changes = entry_list[0].get("changes", [])
-        if not changes:
-            return {"status": "ignored_no_changes"}
-
-        value = changes[0].get("value", {})
-
-        # Si es una notificación de estado (entregado, leído, etc.), la ignoramos limpiamente
-        if "statuses" in value and "messages" not in value:
-            print("ℹ️ Notificación de estado recibida (sent/delivered/read), ignorando...")
-            return {"status": "received_status"}
-
-        # Verificar que realmente exista un mensaje
-        if "messages" not in value or not value["messages"]:
-            print("⚠️ El payload recibido no contiene la clave 'messages'")
-            return {"status": "ignored_no_messages"}
-
-        # Extraer Metadata
-        metadata_value = value.get("metadata", {})
-        tenant_phone = limpiar_numero(metadata_value.get("display_phone_number") or metadata_value.get("phone_number_id") or "default_tenant")
-
-        msg = value["messages"][0]
-        contacts = value.get("contacts", [{}])
-        contact = contacts[0] if contacts else {}
-
-        sender_phone = limpiar_numero(msg.get("from", ""))
+        # 1. Limpiar número del cliente (quitar 'whatsapp:' si viene presente)
+        sender_phone = limpiar_numero(From.replace("whatsapp:", ""))
         remote_jid = sender_phone
-        nombre = contact.get("profile", {}).get("name", "Cliente")
-        msg_type = msg.get("type", "text")
+        tenant_phone = "default_tenant"  # Puedes ajustarlo según tu lógica
 
-        texto = ""
-        media_id = mime = None
+        print(f"🔥 MENSAJE RECIBIDO DE {sender_phone} ({ProfileName}): '{Body}'")
 
-        if msg_type == "text":
-            texto = msg.get("text", {}).get("body", "")
-        elif msg_type in ["image", "audio", "video", "document"]:
-            media_id = msg.get(msg_type, {}).get("id")
-            mime = msg.get(msg_type, {}).get("mime_type")
-            texto = msg.get(msg_type, {}).get("caption", "")
+        # 2. Manejo de archivos multimedia (imágenes, audios, etc.)
+        msg_type = "text"
+        media_id = None
+        mime = MediaContentType0
 
+        if NumMedia > 0:
+          mime_lower = (MediaContentType0 or "").lower()
+          if "image" in mime_lower:
+            msg_type = "image"
+          elif "audio" in mime_lower:
+            msg_type = "audio"
+          else:
+            msg_type = "document"
+        media_id = MediaUrl0
+
+        # 3. Validar si es Admin
         es_admin = bool(ADMIN_PHONE and limpiar_numero(ADMIN_PHONE) in sender_phone)
 
-        if es_admin and texto.lower() in ["/reporte", "/ventas", "!reporte"]:
-            print(f"👑 Comando admin desde {sender_phone} para tenant {tenant_phone}: {texto}")
+        if es_admin and Body.lower() in ["/reporte", "/ventas", "!reporte"]:
+            print(f"👑 Comando admin desde {sender_phone}: {Body}")
             reporte_texto = await obtener_resumen_ventas_hoy(tenant_phone)
-            await enviar_mensaje_whatsapp(remote_jid, reporte_texto)
-            return {"status": "received"}
+            
+            # Asegúrate de usar tu función de envío adaptada a Twilio
+            await enviar_mensaje_whatsapp(From, reporte_texto)
+            return Response(content="<Response></Response>", media_type="text/xml")
 
-        if remote_jid and (texto or media_id):
-            print(f"🚀 Enviando a BackgroundTask para {remote_jid}: {texto}")
+        # 4. Enviar a BackgroundTask para que tu agente LangGraph/Gemini responda
+        if remote_jid and (Body or media_id):
+            print(f"🚀 Enviando a BackgroundTask para {remote_jid}: {Body}")
             background_tasks.add_task(
-                procesar_mensaje_ia, tenant_phone, remote_jid, nombre, texto, msg_type, media_id, mime
+                procesar_mensaje_ia, 
+                tenant_phone, 
+                From,  # Pasamos el JID completo 'whatsapp:+593...' para responder por Twilio
+                ProfileName, 
+                Body, 
+                msg_type, 
+                media_id, 
+                mime
             )
 
     except Exception as e:
-        print(f"❌ Error procesando estructura del webhook: {e}")
+        print(f"❌ Error procesando webhook de Twilio: {e}")
 
-    return {"status": "received"}
+    # Twilio requiere que respondas con TwiML (XML vacío de HTTP 200)
+    return Response(content="<Response></Response>", media_type="text/xml")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
