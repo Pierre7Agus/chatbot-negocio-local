@@ -13,3 +13,4 @@ python-dotenv
 httpx
 langchain-text-splitters
 twilio
+python-multipart
